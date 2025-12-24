@@ -163,7 +163,7 @@ function extractHeaderLines(ws, headerRow) {
 }
 
 /**
- * ✅ Detect columns dynamically (because there are blank/merged columns)
+ * ✅ Detect columns dynamically
  */
 function detectTbColumns(ws) {
   const scanRows = Math.min(ws.rowCount || 0, 40);
@@ -345,7 +345,7 @@ function parseTrialBalanceWorksheetExcelJS(ws, sheetName) {
       indentFromStyle != null ? indentFromStyle : Math.floor(leadingSpaces / SPACES_PER_LEVEL);
 
     flatRows.push({
-      rowNo: r, // stable key (excel row number)
+      rowNo: r,
       ledgerName,
       level,
       opening: parseAmountSide(openingRaw),
@@ -366,16 +366,82 @@ function parseTrialBalanceWorksheetExcelJS(ws, sheetName) {
   };
 }
 
+/* -------------------- audit store (localStorage) -------------------- */
+
+const AUDIT_KEY = "tb_audit_logs_v1";
+
+function safeJsonParse(s, fallback) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return fallback;
+  }
+}
+
+function readAuditLogs() {
+  if (typeof window === "undefined") return [];
+  return safeJsonParse(localStorage.getItem(AUDIT_KEY) || "[]", []);
+}
+
+function writeAuditLogs(logs) {
+  if (typeof window === "undefined") return;
+  localStorage.setItem(AUDIT_KEY, JSON.stringify(logs));
+}
+
+/** add one audit log entry */
+function addAuditLog(entry) {
+  const logs = readAuditLogs();
+  logs.push(entry);
+  writeAuditLogs(logs);
+}
+
+function makeAuditEntry({ sheetName, rowNo, field, oldValue, newValue, user }) {
+  return {
+    id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+    sheetName,
+    rowNo,
+    field, // e.g. "transactions.debit"
+    oldValue,
+    newValue,
+    editedBy: {
+      userId: user?.id ?? user?.userId ?? null,
+      username: user?.username ?? "Unknown",
+      role: user?.role ?? null,
+    },
+    editedAt: new Date().toISOString(),
+  };
+}
+
+/** helpers for UI queries */
+function getLatestEditForCell(logs, { sheetName, rowNo, field }) {
+  const filtered = logs
+    .filter((l) => l.sheetName === sheetName && l.rowNo === rowNo && l.field === field)
+    .sort((a, b) => new Date(b.editedAt) - new Date(a.editedAt));
+  return filtered[0] || null;
+}
+
+function getEditsForCell(logs, { sheetName, rowNo, field }) {
+  return logs
+    .filter((l) => l.sheetName === sheetName && l.rowNo === rowNo && l.field === field)
+    .sort((a, b) => new Date(b.editedAt) - new Date(a.editedAt));
+}
+
+function getEditsForRow(logs, { sheetName, rowNo }) {
+  return logs
+    .filter((l) => l.sheetName === sheetName && l.rowNo === rowNo)
+    .sort((a, b) => new Date(b.editedAt) - new Date(a.editedAt));
+}
+
 /* -------------------- download excel FROM EDITED TABLE -------------------- */
 
 async function downloadAsExcelFromFlatRows({ headerLines, flatRows, selectedSheet }) {
   const wb = new ExcelJS.Workbook();
   const ws = wb.addWorksheet("Trial Balance");
 
-  const totalCols = 5; // A..E
+  const totalCols = 5;
   let currentRow = 1;
 
-  // 1) title/date lines
+  // title/date lines
   for (let i = 0; i < (headerLines?.length || 0); i++) {
     ws.getRow(currentRow).getCell(1).value = headerLines[i];
     ws.mergeCells(currentRow, 1, currentRow, totalCols);
@@ -383,10 +449,9 @@ async function downloadAsExcelFromFlatRows({ headerLines, flatRows, selectedShee
     currentRow += 1;
   }
 
-  // blank line
   currentRow += 1;
 
-  // 2) table header (2 rows)
+  // table header (2 rows)
   const headerTop = currentRow;
   const headerBottom = currentRow + 1;
 
@@ -419,7 +484,6 @@ async function downloadAsExcelFromFlatRows({ headerLines, flatRows, selectedShee
 
   currentRow = headerBottom + 1;
 
-  // 3) DATA FROM EDITED flatRows (preserve level indent)
   for (const r of flatRows || []) {
     const excelRow = ws.getRow(currentRow);
 
@@ -464,6 +528,43 @@ async function downloadAsExcelFromFlatRows({ headerLines, flatRows, selectedShee
   URL.revokeObjectURL(url);
 }
 
+/* -------------------- modal ui -------------------- */
+
+function Modal({ open, title, onClose, children }) {
+  if (!open) return null;
+
+  return (
+    <div className="fixed inset-0 z-[100]">
+      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
+      <div className="absolute inset-0 flex items-center justify-center p-4">
+        <div className="w-full max-w-3xl rounded-2xl bg-white shadow-xl border border-slate-200">
+          <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200">
+            <div>
+              <div className="text-sm font-semibold text-slate-900">{title}</div>
+            </div>
+            <button
+              onClick={onClose}
+              className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
+            >
+              Close
+            </button>
+          </div>
+          <div className="p-5">{children}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function formatDateTime(iso) {
+  try {
+    const d = new Date(iso);
+    return d.toLocaleString();
+  } catch {
+    return iso;
+  }
+}
+
 /* -------------------- component -------------------- */
 
 export default function DocSpecialistHome() {
@@ -471,34 +572,96 @@ export default function DocSpecialistHome() {
   const [user, setUser] = useState(null);
 
   const workbookRef = useRef(null);
-  const originalFlatRowsRef = useRef([]); // ✅ for "Reset changes"
+  const originalFlatRowsRef = useRef([]);
 
   const [fileName, setFileName] = useState("");
   const [sheetNames, setSheetNames] = useState([]);
   const [selectedSheet, setSelectedSheet] = useState("");
 
-  const [meta, setMeta] = useState(null); // ✅ headerLines + cols info
-  const [flatRows, setFlatRows] = useState([]); // ✅ THIS IS YOUR TABLE STATE (editable)
+  const [meta, setMeta] = useState(null);
+  const [flatRows, setFlatRows] = useState([]);
   const [uploadErr, setUploadErr] = useState("");
 
   const [editMode, setEditMode] = useState(false);
-  const [showJson, setShowJson] = useState(false);
+
+  // audit UI state
+  const [auditLogs, setAuditLogs] = useState([]);
+  const [auditModalOpen, setAuditModalOpen] = useState(false);
+  const [auditModalTitle, setAuditModalTitle] = useState("");
+  const [auditModalLogs, setAuditModalLogs] = useState([]);
 
   useEffect(() => {
     const u = getSession();
     if (!u) return router.replace("/auth/login");
-    if (u.role !== "DOC_SPECIALIST") return router.replace(ROLE_HOME[u.role] || "/auth/login");
+    // You said A/B/C/D can edit, Y monitors. For now allow all to load page.
+    // Gate edit mode by role if you want (example below).
     setUser(u);
+
+    // load audit logs
+    setAuditLogs(readAuditLogs());
   }, [router]);
 
   // Build nested preview from EDITED flatRows
   const treeRows = useMemo(() => buildTreeFromLevels(flatRows), [flatRows]);
   const previewRows = useMemo(() => flattenTreeRows(treeRows).slice(0, 300), [treeRows]);
 
+  // OPTIONAL: gate editMode button
+  const canEdit = useMemo(() => {
+    const role = user?.role;
+    return ["A", "B", "C", "D", "DOC_SPECIALIST"].includes(role);
+  }, [user]);
+
+  function openRowAudit(rowNo) {
+    const logs = readAuditLogs();
+    setAuditLogs(logs);
+
+    const rowLogs = getEditsForRow(logs, { sheetName: selectedSheet, rowNo });
+    setAuditModalTitle(`Row Audit • Sheet "${selectedSheet}" • rowNo ${rowNo}`);
+    setAuditModalLogs(rowLogs);
+    setAuditModalOpen(true);
+  }
+
+  function openCellAudit(rowNo, field) {
+    const logs = readAuditLogs();
+    setAuditLogs(logs);
+
+    const cellLogs = getEditsForCell(logs, { sheetName: selectedSheet, rowNo, field });
+    setAuditModalTitle(`Cell Audit • ${field} • rowNo ${rowNo}`);
+    setAuditModalLogs(cellLogs);
+    setAuditModalOpen(true);
+  }
+
+  function logChange(rowNo, field, oldValue, newValue) {
+    // don’t log if not changed
+    const oldS = JSON.stringify(oldValue ?? null);
+    const newS = JSON.stringify(newValue ?? null);
+    if (oldS === newS) return;
+
+    const entry = makeAuditEntry({
+      sheetName: selectedSheet,
+      rowNo,
+      field,
+      oldValue,
+      newValue,
+      user,
+    });
+
+    addAuditLog(entry);
+    // refresh local state
+    const logs = readAuditLogs();
+    setAuditLogs(logs);
+  }
+
   function updateRow(rowNo, patch) {
     setFlatRows((prev) => {
       const idx = prev.findIndex((x) => x.rowNo === rowNo);
       if (idx === -1) return prev;
+
+      const current = prev[idx];
+      // log ledgerName changes if present
+      if (Object.prototype.hasOwnProperty.call(patch, "ledgerName")) {
+        logChange(rowNo, "ledgerName", current.ledgerName, patch.ledgerName);
+      }
 
       const updated = [...prev];
       updated[idx] = { ...updated[idx], ...patch };
@@ -510,6 +673,7 @@ export default function DocSpecialistHome() {
     setFlatRows((prev) => {
       const idx = prev.findIndex((x) => x.rowNo === rowNo);
       if (idx === -1) return prev;
+
       const updated = [...prev];
       const row = updated[idx];
 
@@ -518,8 +682,17 @@ export default function DocSpecialistHome() {
         opening: { ...(row.opening || { amount: null, side: null }) },
       };
 
-      if (field === "amount") next.opening.amount = value === "" ? null : toNumberSafe(value);
-      if (field === "side") next.opening.side = value || null;
+      if (field === "amount") {
+        const newAmt = value === "" ? null : toNumberSafe(value);
+        logChange(rowNo, "opening.amount", row.opening?.amount ?? null, newAmt);
+        next.opening.amount = newAmt;
+      }
+
+      if (field === "side") {
+        const newSide = value || null;
+        logChange(rowNo, "opening.side", row.opening?.side ?? null, newSide);
+        next.opening.side = newSide;
+      }
 
       updated[idx] = next;
       return updated;
@@ -530,6 +703,7 @@ export default function DocSpecialistHome() {
     setFlatRows((prev) => {
       const idx = prev.findIndex((x) => x.rowNo === rowNo);
       if (idx === -1) return prev;
+
       const updated = [...prev];
       const row = updated[idx];
 
@@ -538,8 +712,17 @@ export default function DocSpecialistHome() {
         closing: { ...(row.closing || { amount: null, side: null }) },
       };
 
-      if (field === "amount") next.closing.amount = value === "" ? null : toNumberSafe(value);
-      if (field === "side") next.closing.side = value || null;
+      if (field === "amount") {
+        const newAmt = value === "" ? null : toNumberSafe(value);
+        logChange(rowNo, "closing.amount", row.closing?.amount ?? null, newAmt);
+        next.closing.amount = newAmt;
+      }
+
+      if (field === "side") {
+        const newSide = value || null;
+        logChange(rowNo, "closing.side", row.closing?.side ?? null, newSide);
+        next.closing.side = newSide;
+      }
 
       updated[idx] = next;
       return updated;
@@ -559,7 +742,17 @@ export default function DocSpecialistHome() {
         transactions: { ...(row.transactions || { debit: null, credit: null }) },
       };
 
-      next.transactions[field] = value === "" ? null : toNumberSafe(value);
+      const newVal = value === "" ? null : toNumberSafe(value);
+
+      if (field === "debit") {
+        logChange(rowNo, "transactions.debit", row.transactions?.debit ?? null, newVal);
+        next.transactions.debit = newVal;
+      }
+
+      if (field === "credit") {
+        logChange(rowNo, "transactions.credit", row.transactions?.credit ?? null, newVal);
+        next.transactions.credit = newVal;
+      }
 
       updated[idx] = next;
       return updated;
@@ -599,19 +792,6 @@ export default function DocSpecialistHome() {
         setMeta(parsed.meta);
         setFlatRows(parsed.rowsFlat);
         originalFlatRowsRef.current = parsed.rowsFlat.map((x) => JSON.parse(JSON.stringify(x)));
-
-        // optional: store for later steps
-        localStorage.setItem("trialbalance_uploaded_filename", file.name);
-        localStorage.setItem(
-          "trialbalance_uploaded_json",
-          JSON.stringify({
-            type: "TRIAL_BALANCE",
-            sheetName: parsed.sheetName,
-            extractedAt: new Date().toISOString(),
-            meta: parsed.meta,
-            rowsFlat: parsed.rowsFlat,
-          })
-        );
       }
     } catch (err) {
       setUploadErr(err?.message || "Failed to parse Excel");
@@ -647,9 +827,26 @@ export default function DocSpecialistHome() {
   async function downloadExcelFromTable() {
     await downloadAsExcelFromFlatRows({
       headerLines: meta?.headerLines || [],
-      flatRows, // ✅ edited table values
+      flatRows,
       selectedSheet,
     });
+  }
+
+  // For each cell, show an ⓘ badge if edited at least once
+  function CellInfoButton({ rowNo, field }) {
+    const latest = getLatestEditForCell(auditLogs, { sheetName: selectedSheet, rowNo, field });
+    if (!latest) return <span className="inline-block w-5" />;
+
+    return (
+      <button
+        type="button"
+        title={`Last edited by ${latest.editedBy?.username || "Unknown"} at ${formatDateTime(latest.editedAt)}`}
+        onClick={() => openCellAudit(rowNo, field)}
+        className="ml-2 inline-flex h-5 w-5 items-center justify-center rounded-full border border-slate-200 text-[11px] text-slate-700 hover:bg-slate-50"
+      >
+        i
+      </button>
+    );
   }
 
   if (!user) return null;
@@ -684,9 +881,6 @@ export default function DocSpecialistHome() {
       <section className="mx-auto max-w-6xl px-4 py-6">
         <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
           <h2 className="text-base font-semibold text-slate-900">Upload Excel</h2>
-          <p className="mt-1 text-sm text-slate-500">
-            Parse TB → Preview → Edit → Download Excel (download uses edited table data)
-          </p>
 
           <div className="mt-4 space-y-3">
             <input
@@ -699,12 +893,6 @@ export default function DocSpecialistHome() {
                          file:text-sm file:font-medium file:text-white
                          hover:file:bg-slate-800"
             />
-
-            {fileName ? (
-              <p className="text-xs text-slate-500">
-                Selected: <span className="font-medium text-slate-700">{fileName}</span>
-              </p>
-            ) : null}
 
             {sheetNames.length ? (
               <div className="flex flex-wrap items-center gap-2">
@@ -746,21 +934,21 @@ export default function DocSpecialistHome() {
             {meta && flatRows.length ? (
               <div className="flex flex-wrap items-center justify-between gap-2 pt-2">
                 <div className="text-xs text-slate-500">
-                  Parsed <span className="font-medium text-slate-700">{flatRows.length}</span> rows
-                  <div className="mt-1 text-[11px] text-slate-400">
-                    Header lines: {meta.headerLines?.length ?? 0} • Data starts: {meta.dataStartIdx}
-                  </div>
+                  Parsed <span className="font-medium text-slate-700">{flatRows.length}</span> rows • Audit logs:{" "}
+                  <span className="font-medium text-slate-700">{auditLogs.length}</span>
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setEditMode((v) => !v)}
-                    className="rounded-xl bg-slate-900 px-3 py-2 text-xs font-medium text-white
-                               hover:bg-slate-800 active:bg-slate-950 transition"
-                  >
-                    {editMode ? "Exit Edit Mode" : "Edit Mode"}
-                  </button>
+                  {canEdit ? (
+                    <button
+                      type="button"
+                      onClick={() => setEditMode((v) => !v)}
+                      className="rounded-xl bg-slate-900 px-3 py-2 text-xs font-medium text-white
+                                 hover:bg-slate-800 active:bg-slate-950 transition"
+                    >
+                      {editMode ? "Exit Edit Mode" : "Edit Mode"}
+                    </button>
+                  ) : null}
 
                   <button
                     type="button"
@@ -779,15 +967,6 @@ export default function DocSpecialistHome() {
                   >
                     Download Excel (Edited)
                   </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setShowJson((v) => !v)}
-                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700
-                               hover:bg-slate-50 active:bg-slate-100"
-                  >
-                    {showJson ? "Hide JSON" : "Show JSON"}
-                  </button>
                 </div>
               </div>
             ) : null}
@@ -797,7 +976,7 @@ export default function DocSpecialistHome() {
         {/* Preview */}
         {meta && flatRows.length ? (
           <div className="mt-6 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-            <h3 className="text-base font-semibold text-slate-900">Preview (editable)</h3>
+            <h3 className="text-base font-semibold text-slate-900">Preview</h3>
 
             <div className="mt-4 overflow-auto rounded-xl border border-slate-200">
               <table className="min-w-full text-sm">
@@ -808,120 +987,188 @@ export default function DocSpecialistHome() {
                     <th className="px-3 py-2 border-b border-slate-200">Debit</th>
                     <th className="px-3 py-2 border-b border-slate-200">Credit</th>
                     <th className="px-3 py-2 border-b border-slate-200">Closing</th>
+                    <th className="px-3 py-2 border-b border-slate-200 text-right">Audit</th>
                   </tr>
                 </thead>
 
                 <tbody>
                   {previewRows.map((r) => (
                     <tr key={r.rowNo} className="odd:bg-white even:bg-slate-50">
+                      {/* Ledger */}
                       <td className="px-3 py-2 border-b border-slate-200">
-                        {editMode ? (
-                          <input
-                            className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm"
-                            style={{ paddingLeft: 8 + (r.level || 0) * 16 }}
-                            value={r.ledgerName ?? ""}
-                            onChange={(e) => updateRow(r.rowNo, { ledgerName: e.target.value })}
-                          />
-                        ) : (
-                          <span className="text-slate-700" style={{ paddingLeft: (r.level || 0) * 16, display: "inline-block" }}>
-                            {r.ledgerName}
-                          </span>
-                        )}
+                        <div className="flex items-center">
+                          {editMode ? (
+                            <input
+                              className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm text-black"
+                              style={{ paddingLeft: 8 + (r.level || 0) * 16 }}
+                              value={r.ledgerName ?? ""}
+                              onChange={(e) => updateRow(r.rowNo, { ledgerName: e.target.value })}
+                            />
+                          ) : (
+                            <span
+                              className="text-slate-700"
+                              style={{ paddingLeft: (r.level || 0) * 16, display: "inline-block" }}
+                            >
+                              {r.ledgerName}
+                            </span>
+                          )}
+                          <CellInfoButton rowNo={r.rowNo} field="ledgerName" />
+                        </div>
                       </td>
 
+                      {/* Opening */}
                       <td className="px-3 py-2 border-b border-slate-200 text-slate-700">
-                        {editMode ? (
-                          <div className="flex items-center gap-2">
+                        <div className="flex items-center">
+                          {editMode ? (
+                            <div className="flex items-center gap-2">
+                              <input
+                                className="w-28 rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm"
+                                value={r.opening?.amount ?? ""}
+                                onChange={(e) => updateOpening(r.rowNo, "amount", e.target.value)}
+                                placeholder="amount"
+                              />
+                              <select
+                                className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm"
+                                value={r.opening?.side ?? ""}
+                                onChange={(e) => updateOpening(r.rowNo, "side", e.target.value)}
+                              >
+                                <option value="">-</option>
+                                <option value="Dr">Dr</option>
+                                <option value="Cr">Cr</option>
+                              </select>
+                            </div>
+                          ) : (
+                            formatAmountSide(r.opening)
+                          )}
+                          <CellInfoButton rowNo={r.rowNo} field="opening.amount" />
+                        </div>
+                      </td>
+
+                      {/* Debit */}
+                      <td className="px-3 py-2 border-b border-slate-200 text-slate-700">
+                        <div className="flex items-center">
+                          {editMode ? (
                             <input
                               className="w-28 rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm"
-                              value={r.opening?.amount ?? ""}
-                              onChange={(e) => updateOpening(r.rowNo, "amount", e.target.value)}
-                              placeholder="amount"
+                              value={r.transactions?.debit ?? ""}
+                              onChange={(e) => updateTxn(r.rowNo, "debit", e.target.value)}
                             />
-                            <select
-                              className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm"
-                              value={r.opening?.side ?? ""}
-                              onChange={(e) => updateOpening(r.rowNo, "side", e.target.value)}
-                            >
-                              <option value="">-</option>
-                              <option value="Dr">Dr</option>
-                              <option value="Cr">Cr</option>
-                            </select>
-                          </div>
-                        ) : (
-                          formatAmountSide(r.opening)
-                        )}
+                          ) : (
+                            r.transactions?.debit ?? ""
+                          )}
+                          <CellInfoButton rowNo={r.rowNo} field="transactions.debit" />
+                        </div>
                       </td>
 
+                      {/* Credit */}
                       <td className="px-3 py-2 border-b border-slate-200 text-slate-700">
-                        {editMode ? (
-                          <input
-                            className="w-28 rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm"
-                            value={r.transactions?.debit ?? ""}
-                            onChange={(e) => updateTxn(r.rowNo, "debit", e.target.value)}
-                          />
-                        ) : (
-                          r.transactions?.debit ?? ""
-                        )}
-                      </td>
-
-                      <td className="px-3 py-2 border-b border-slate-200 text-slate-700">
-                        {editMode ? (
-                          <input
-                            className="w-28 rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm"
-                            value={r.transactions?.credit ?? ""}
-                            onChange={(e) => updateTxn(r.rowNo, "credit", e.target.value)}
-                          />
-                        ) : (
-                          r.transactions?.credit ?? ""
-                        )}
-                      </td>
-
-                      <td className="px-3 py-2 border-b border-slate-200 text-slate-700">
-                        {editMode ? (
-                          <div className="flex items-center gap-2">
+                        <div className="flex items-center">
+                          {editMode ? (
                             <input
                               className="w-28 rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm"
-                              value={r.closing?.amount ?? ""}
-                              onChange={(e) => updateClosing(r.rowNo, "amount", e.target.value)}
-                              placeholder="amount"
+                              value={r.transactions?.credit ?? ""}
+                              onChange={(e) => updateTxn(r.rowNo, "credit", e.target.value)}
                             />
-                            <select
-                              className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm"
-                              value={r.closing?.side ?? ""}
-                              onChange={(e) => updateClosing(r.rowNo, "side", e.target.value)}
-                            >
-                              <option value="">-</option>
-                              <option value="Dr">Dr</option>
-                              <option value="Cr">Cr</option>
-                            </select>
-                          </div>
-                        ) : (
-                          formatAmountSide(r.closing)
-                        )}
+                          ) : (
+                            r.transactions?.credit ?? ""
+                          )}
+                          <CellInfoButton rowNo={r.rowNo} field="transactions.credit" />
+                        </div>
+                      </td>
+
+                      {/* Closing */}
+                      <td className="px-3 py-2 border-b border-slate-200 text-slate-700">
+                        <div className="flex items-center">
+                          {editMode ? (
+                            <div className="flex items-center gap-2">
+                              <input
+                                className="w-28 rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm"
+                                value={r.closing?.amount ?? ""}
+                                onChange={(e) => updateClosing(r.rowNo, "amount", e.target.value)}
+                                placeholder="amount"
+                              />
+                              <select
+                                className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm"
+                                value={r.closing?.side ?? ""}
+                                onChange={(e) => updateClosing(r.rowNo, "side", e.target.value)}
+                              >
+                                <option value="">-</option>
+                                <option value="Dr">Dr</option>
+                                <option value="Cr">Cr</option>
+                              </select>
+                            </div>
+                          ) : (
+                            formatAmountSide(r.closing)
+                          )}
+                          <CellInfoButton rowNo={r.rowNo} field="closing.amount" />
+                        </div>
+                      </td>
+
+                      {/* Row audit */}
+                      <td className="px-3 py-2 border-b border-slate-200 text-right">
+                        <button
+                          type="button"
+                          onClick={() => openRowAudit(r.rowNo)}
+                          className="inline-flex items-center justify-center rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                          title="View row audit"
+                        >
+                          👁
+                        </button>
                       </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
-
-            {showJson ? (
-              <pre className="mt-4 max-h-96 overflow-auto rounded-xl bg-slate-900 p-4 text-xs text-slate-100">
-                {JSON.stringify(
-                  {
-                    meta,
-                    // IMPORTANT: download uses flatRows (edited state)
-                    rowsFlat: flatRows,
-                  },
-                  null,
-                  2
-                )}
-              </pre>
-            ) : null}
           </div>
         ) : null}
       </section>
+
+      {/* Audit modal */}
+      <Modal
+        open={auditModalOpen}
+        title={auditModalTitle}
+        onClose={() => setAuditModalOpen(false)}
+      >
+        {auditModalLogs.length === 0 ? (
+          <div className="text-sm text-slate-600">No edits recorded for this selection.</div>
+        ) : (
+          <div className="overflow-auto rounded-xl border border-slate-200">
+            <table className="min-w-full text-sm">
+              <thead className="bg-slate-50">
+                <tr className="text-left text-slate-600">
+                  <th className="px-3 py-2 border-b border-slate-200">When</th>
+                  <th className="px-3 py-2 border-b border-slate-200">User</th>
+                  <th className="px-3 py-2 border-b border-slate-200">Role</th>
+                  <th className="px-3 py-2 border-b border-slate-200">Field</th>
+                  <th className="px-3 py-2 border-b border-slate-200">Old</th>
+                  <th className="px-3 py-2 border-b border-slate-200">New</th>
+                </tr>
+              </thead>
+              <tbody>
+                {auditModalLogs.map((l) => (
+                  <tr key={l.id} className="odd:bg-white even:bg-slate-50 text-black">
+                    <td className="px-3 py-2 border-b  border-slate-200">{formatDateTime(l.editedAt)}</td>
+                    <td className="px-3 py-2 border-b border-slate-200">{l.editedBy?.username || "Unknown"}</td>
+                    <td className="px-3 py-2 border-b border-slate-200">{l.editedBy?.role || "-"}</td>
+                    <td className="px-3 py-2 border-b border-slate-200">{l.field}</td>
+                    <td className="px-3 py-2 border-b border-slate-200 text-slate-600">
+                      {String(l.oldValue ?? "")}
+                    </td>
+                    <td className="px-3 py-2 border-b border-slate-200 font-medium text-slate-900">
+                      {String(l.newValue ?? "")}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <div className="mt-4 text-xs text-slate-500">
+          Note: this demo uses <span className="font-medium">localStorage</span>. In production, store audit logs in DB so Y can see edits from all users/devices.
+        </div>
+      </Modal>
     </main>
   );
 }
