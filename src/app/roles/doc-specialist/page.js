@@ -12,6 +12,7 @@ import { ROLE_HOME } from "@/app/lib/roleRoutes";
 
 function toNumberSafe(val) {
   const s = String(val ?? "").replace(/,/g, "").trim();
+  if (!s) return null;
   const n = Number(s);
   return Number.isFinite(n) ? n : null;
 }
@@ -43,6 +44,11 @@ function parseAmountSide(input) {
   const amount = toNumberSafe(m[1]);
   const side = m[2] ? (m[2].toUpperCase() === "DR" ? "Dr" : "Cr") : null;
   return { amount, side };
+}
+
+function formatAmountSide(obj) {
+  if (!obj || obj.amount == null) return "";
+  return obj.side ? `${obj.amount} ${obj.side}` : String(obj.amount);
 }
 
 function buildTreeFromLevels(flatRows) {
@@ -87,7 +93,7 @@ function flattenTreeRows(treeRows) {
 }
 
 /**
- * ✅ Null-safe cell -> string (merged blanks + formula safe)
+ * ✅ Null-safe cell -> string
  */
 function cellText(cell) {
   try {
@@ -116,8 +122,7 @@ function cellText(cell) {
 }
 
 /**
- * ✅ Capture top header rows ABOVE the table (Trial Balance, date range, etc.)
- * We take rows 1..(headerRow-1) and build readable lines.
+ * ✅ Capture title/date lines above table WITHOUT repeating merged texts.
  */
 function extractHeaderLines(ws, headerRow) {
   const lines = [];
@@ -126,7 +131,6 @@ function extractHeaderLines(ws, headerRow) {
   for (let r = 1; r < headerRow; r++) {
     const row = ws.getRow(r);
 
-    // collect texts but dedupe within the same row
     const parts = [];
     const seen = new Set();
 
@@ -135,19 +139,18 @@ function extractHeaderLines(ws, headerRow) {
       const txt = raw.replace(/\s+/g, " ").trim();
       if (!txt) continue;
 
-      // ✅ if the same text repeats across merged cells, keep only once
+      // prevent "Trial Balance Trial Balance ..." from merged cells
       if (seen.has(txt)) continue;
 
       seen.add(txt);
       parts.push(txt);
     }
 
-    // final line for this row
     const line = parts.join(" ").trim();
     if (line) lines.push(line);
   }
 
-  // ✅ remove duplicate full lines too (just in case)
+  // remove full-line duplicates
   const uniq = [];
   const lineSeen = new Set();
   for (const l of lines) {
@@ -160,7 +163,7 @@ function extractHeaderLines(ws, headerRow) {
 }
 
 /**
- * ✅ Find where "Particulars / Opening / Debit / Credit / Closing" columns are.
+ * ✅ Detect columns dynamically (because there are blank/merged columns)
  */
 function detectTbColumns(ws) {
   const scanRows = Math.min(ws.rowCount || 0, 40);
@@ -168,7 +171,6 @@ function detectTbColumns(ws) {
 
   let headerRow = -1;
 
-  // 1) find a header row near "Particulars"
   for (let r = 1; r <= scanRows; r++) {
     const row = ws.getRow(r);
 
@@ -191,7 +193,7 @@ function detectTbColumns(ws) {
       }
     }
 
-    // Particulars may appear before opening/closing row
+    // sometimes the other keywords appear on next rows
     if (hasPart && !hasOther) {
       for (let rr = r; rr <= Math.min(r + 2, scanRows); rr++) {
         const rrow = ws.getRow(rr);
@@ -219,7 +221,6 @@ function detectTbColumns(ws) {
   }
 
   if (headerRow === -1) {
-    // fallback
     return {
       headerRow: 1,
       particularsCol: 1,
@@ -230,7 +231,6 @@ function detectTbColumns(ws) {
     };
   }
 
-  // 2) within headerRow..headerRow+2 find columns
   let particularsCol = null;
   let openingCol = null;
   let debitCol = null;
@@ -253,7 +253,7 @@ function detectTbColumns(ws) {
     }
   }
 
-  // fallback if Debit/Credit appear like "Transactions Debit"
+  // fallback if Debit/Credit found as "Transactions Debit"
   if (debitCol == null || creditCol == null) {
     for (const r of searchRows) {
       const row = ws.getRow(r);
@@ -277,7 +277,7 @@ function detectTbColumns(ws) {
 }
 
 /**
- * ✅ Decide where the actual data starts (below headers)
+ * ✅ Decide where data starts (skip headers)
  */
 function detectDataStartRow(ws, headerRow, particularsCol) {
   const scanLimit = Math.min(ws.rowCount || 0, headerRow + 25);
@@ -304,7 +304,7 @@ function detectDataStartRow(ws, headerRow, particularsCol) {
   return headerRow + 1;
 }
 
-/* -------------------- main parser -------------------- */
+/* -------------------- parse worksheet -> meta + rowsFlat -------------------- */
 
 function parseTrialBalanceWorksheetExcelJS(ws, sheetName) {
   const { headerRow, particularsCol, openingCol, debitCol, creditCol, closingCol } =
@@ -345,90 +345,64 @@ function parseTrialBalanceWorksheetExcelJS(ws, sheetName) {
       indentFromStyle != null ? indentFromStyle : Math.floor(leadingSpaces / SPACES_PER_LEVEL);
 
     flatRows.push({
+      rowNo: r, // stable key (excel row number)
       ledgerName,
       level,
       opening: parseAmountSide(openingRaw),
       transactions: { debit: toNumberSafe(txDebitRaw), credit: toNumberSafe(txCreditRaw) },
       closing: parseAmountSide(closingRaw),
-      rowNo: r,
     });
   }
 
   return {
-    type: "TRIAL_BALANCE",
     sheetName,
-    extractedAt: new Date().toISOString(),
     meta: {
-      headerLines, // ✅ captured top section (Trial Balance + date range + anything above table)
+      headerLines,
       headerRow,
       dataStartIdx,
       columns: { particularsCol, openingCol, debitCol, creditCol, closingCol },
     },
-    rows: buildTreeFromLevels(flatRows),
     rowsFlat: flatRows,
   };
 }
 
-/* -------------------- export to excel -------------------- */
+/* -------------------- download excel FROM EDITED TABLE -------------------- */
 
-function formatAmountSide(obj) {
-  if (!obj || obj.amount == null) return "";
-  return obj.side ? `${obj.amount} ${obj.side}` : String(obj.amount);
-}
-
-async function downloadAsExcel(tbJson, selectedSheet) {
-  if (!tbJson) return;
-
+async function downloadAsExcelFromFlatRows({ headerLines, flatRows, selectedSheet }) {
   const wb = new ExcelJS.Workbook();
   const ws = wb.addWorksheet("Trial Balance");
 
-  // ✅ 1) Write captured header lines (Trial Balance, date range etc.)
-  const headerLines = tbJson?.meta?.headerLines || [];
   const totalCols = 5; // A..E
-
   let currentRow = 1;
 
-  for (let i = 0; i < headerLines.length; i++) {
-    const line = headerLines[i];
-    ws.getRow(currentRow).getCell(1).value = line;
-
-    // Merge A..E for title lines
+  // 1) title/date lines
+  for (let i = 0; i < (headerLines?.length || 0); i++) {
+    ws.getRow(currentRow).getCell(1).value = headerLines[i];
     ws.mergeCells(currentRow, 1, currentRow, totalCols);
-
-    // Style: first line bold & bigger
-    if (i === 0) {
-      ws.getRow(currentRow).font = { bold: true, size: 14 };
-    } else {
-      ws.getRow(currentRow).font = { bold: true };
-    }
-
+    ws.getRow(currentRow).font = i === 0 ? { bold: true, size: 14 } : { bold: true };
     currentRow += 1;
   }
 
-  // Add one blank row after header
+  // blank line
   currentRow += 1;
 
-  // ✅ 2) Create a 2-row table header like the source sheet
+  // 2) table header (2 rows)
   const headerTop = currentRow;
   const headerBottom = currentRow + 1;
 
-  // Row 1
   ws.getRow(headerTop).getCell(1).value = "Particulars";
   ws.getRow(headerTop).getCell(2).value = "Opening Balance";
   ws.getRow(headerTop).getCell(3).value = "Transactions";
   ws.getRow(headerTop).getCell(5).value = "Closing Balance";
 
-  // Row 2
   ws.getRow(headerBottom).getCell(3).value = "Debit";
   ws.getRow(headerBottom).getCell(4).value = "Credit";
 
-  // Merges for header layout
-  ws.mergeCells(headerTop, 1, headerBottom, 1); // Particulars vertical
-  ws.mergeCells(headerTop, 2, headerBottom, 2); // Opening Balance vertical
-  ws.mergeCells(headerTop, 5, headerBottom, 5); // Closing Balance vertical
-  ws.mergeCells(headerTop, 3, headerTop, 4); // Transactions spans Debit+Credit
+  ws.mergeCells(headerTop, 1, headerBottom, 1);
+  ws.mergeCells(headerTop, 2, headerBottom, 2);
+  ws.mergeCells(headerTop, 5, headerBottom, 5);
+  ws.mergeCells(headerTop, 3, headerTop, 4);
 
-  // Style header rows
   for (let r = headerTop; r <= headerBottom; r++) {
     const row = ws.getRow(r);
     row.font = { bold: true };
@@ -445,22 +419,18 @@ async function downloadAsExcel(tbJson, selectedSheet) {
 
   currentRow = headerBottom + 1;
 
-  // ✅ 3) Add data rows (flatten nested)
-  const flat = flattenTreeRows(tbJson.rows);
-
-  for (const r of flat) {
+  // 3) DATA FROM EDITED flatRows (preserve level indent)
+  for (const r of flatRows || []) {
     const excelRow = ws.getRow(currentRow);
 
-    excelRow.getCell(1).value = r.ledgerName;
+    excelRow.getCell(1).value = r.ledgerName ?? "";
     excelRow.getCell(2).value = formatAmountSide(r.opening);
     excelRow.getCell(3).value = r.transactions?.debit ?? "";
     excelRow.getCell(4).value = r.transactions?.credit ?? "";
     excelRow.getCell(5).value = formatAmountSide(r.closing);
 
-    // keep nesting indentation in Excel
     excelRow.getCell(1).alignment = { indent: r.level || 0, vertical: "middle" };
 
-    // borders for data rows (optional but looks clean)
     excelRow.eachCell({ includeEmpty: true }, (cell) => {
       cell.border = {
         top: { style: "thin" },
@@ -475,19 +445,17 @@ async function downloadAsExcel(tbJson, selectedSheet) {
     currentRow += 1;
   }
 
-  // ✅ 4) Column widths
-  ws.getColumn(1).width = 45; // Particulars
+  ws.getColumn(1).width = 45;
   ws.getColumn(2).width = 18;
   ws.getColumn(3).width = 16;
   ws.getColumn(4).width = 16;
   ws.getColumn(5).width = 18;
 
-  // ✅ 5) Download
   const buffer = await wb.xlsx.writeBuffer();
-
   const blob = new Blob([buffer], {
     type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   });
+
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -503,14 +471,18 @@ export default function DocSpecialistHome() {
   const [user, setUser] = useState(null);
 
   const workbookRef = useRef(null);
+  const originalFlatRowsRef = useRef([]); // ✅ for "Reset changes"
 
   const [fileName, setFileName] = useState("");
   const [sheetNames, setSheetNames] = useState([]);
   const [selectedSheet, setSelectedSheet] = useState("");
 
-  const [tbJson, setTbJson] = useState(null);
+  const [meta, setMeta] = useState(null); // ✅ headerLines + cols info
+  const [flatRows, setFlatRows] = useState([]); // ✅ THIS IS YOUR TABLE STATE (editable)
   const [uploadErr, setUploadErr] = useState("");
-  const [showJson, setShowJson] = useState(true);
+
+  const [editMode, setEditMode] = useState(false);
+  const [showJson, setShowJson] = useState(false);
 
   useEffect(() => {
     const u = getSession();
@@ -519,20 +491,92 @@ export default function DocSpecialistHome() {
     setUser(u);
   }, [router]);
 
-  const previewRows = useMemo(() => {
-    const tree = tbJson?.rows || [];
-    return flattenTreeRows(tree).slice(0, 300);
-  }, [tbJson]);
+  // Build nested preview from EDITED flatRows
+  const treeRows = useMemo(() => buildTreeFromLevels(flatRows), [flatRows]);
+  const previewRows = useMemo(() => flattenTreeRows(treeRows).slice(0, 300), [treeRows]);
+
+  function updateRow(rowNo, patch) {
+    setFlatRows((prev) => {
+      const idx = prev.findIndex((x) => x.rowNo === rowNo);
+      if (idx === -1) return prev;
+
+      const updated = [...prev];
+      updated[idx] = { ...updated[idx], ...patch };
+      return updated;
+    });
+  }
+
+  function updateOpening(rowNo, field, value) {
+    setFlatRows((prev) => {
+      const idx = prev.findIndex((x) => x.rowNo === rowNo);
+      if (idx === -1) return prev;
+      const updated = [...prev];
+      const row = updated[idx];
+
+      const next = {
+        ...row,
+        opening: { ...(row.opening || { amount: null, side: null }) },
+      };
+
+      if (field === "amount") next.opening.amount = value === "" ? null : toNumberSafe(value);
+      if (field === "side") next.opening.side = value || null;
+
+      updated[idx] = next;
+      return updated;
+    });
+  }
+
+  function updateClosing(rowNo, field, value) {
+    setFlatRows((prev) => {
+      const idx = prev.findIndex((x) => x.rowNo === rowNo);
+      if (idx === -1) return prev;
+      const updated = [...prev];
+      const row = updated[idx];
+
+      const next = {
+        ...row,
+        closing: { ...(row.closing || { amount: null, side: null }) },
+      };
+
+      if (field === "amount") next.closing.amount = value === "" ? null : toNumberSafe(value);
+      if (field === "side") next.closing.side = value || null;
+
+      updated[idx] = next;
+      return updated;
+    });
+  }
+
+  function updateTxn(rowNo, field, value) {
+    setFlatRows((prev) => {
+      const idx = prev.findIndex((x) => x.rowNo === rowNo);
+      if (idx === -1) return prev;
+
+      const updated = [...prev];
+      const row = updated[idx];
+
+      const next = {
+        ...row,
+        transactions: { ...(row.transactions || { debit: null, credit: null }) },
+      };
+
+      next.transactions[field] = value === "" ? null : toNumberSafe(value);
+
+      updated[idx] = next;
+      return updated;
+    });
+  }
 
   async function handleExcelUpload(e) {
     const file = e.target.files?.[0];
     if (!file) return;
 
     setUploadErr("");
-    setTbJson(null);
+    setMeta(null);
+    setFlatRows([]);
     setSheetNames([]);
     setSelectedSheet("");
     setFileName(file.name);
+    setEditMode(false);
 
     try {
       const buf = await file.arrayBuffer();
@@ -550,11 +594,24 @@ export default function DocSpecialistHome() {
 
       if (first) {
         const ws = wb.getWorksheet(first);
-        const json = parseTrialBalanceWorksheetExcelJS(ws, first);
-        setTbJson(json);
+        const parsed = parseTrialBalanceWorksheetExcelJS(ws, first);
 
+        setMeta(parsed.meta);
+        setFlatRows(parsed.rowsFlat);
+        originalFlatRowsRef.current = parsed.rowsFlat.map((x) => JSON.parse(JSON.stringify(x)));
+
+        // optional: store for later steps
         localStorage.setItem("trialbalance_uploaded_filename", file.name);
-        localStorage.setItem("trialbalance_uploaded_json", JSON.stringify(json));
+        localStorage.setItem(
+          "trialbalance_uploaded_json",
+          JSON.stringify({
+            type: "TRIAL_BALANCE",
+            sheetName: parsed.sheetName,
+            extractedAt: new Date().toISOString(),
+            meta: parsed.meta,
+            rowsFlat: parsed.rowsFlat,
+          })
+        );
       }
     } catch (err) {
       setUploadErr(err?.message || "Failed to parse Excel");
@@ -566,27 +623,33 @@ export default function DocSpecialistHome() {
     if (!wb) return;
 
     setUploadErr("");
-    setTbJson(null);
+    setMeta(null);
+    setFlatRows([]);
+    setEditMode(false);
 
     try {
       const ws = wb.getWorksheet(sheet);
-      const json = parseTrialBalanceWorksheetExcelJS(ws, sheet);
-      setTbJson(json);
-      localStorage.setItem("trialbalance_uploaded_json", JSON.stringify(json));
+      const parsed = parseTrialBalanceWorksheetExcelJS(ws, sheet);
+
+      setMeta(parsed.meta);
+      setFlatRows(parsed.rowsFlat);
+      originalFlatRowsRef.current = parsed.rowsFlat.map((x) => JSON.parse(JSON.stringify(x)));
     } catch (err) {
       setUploadErr(err?.message || "Failed to parse selected sheet");
     }
   }
 
-  function downloadJson() {
-    if (!tbJson) return;
-    const blob = new Blob([JSON.stringify(tbJson, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `trialbalance_${selectedSheet || "sheet"}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+  function resetEdits() {
+    setFlatRows(originalFlatRowsRef.current.map((x) => JSON.parse(JSON.stringify(x))));
+    setEditMode(false);
+  }
+
+  async function downloadExcelFromTable() {
+    await downloadAsExcelFromFlatRows({
+      headerLines: meta?.headerLines || [],
+      flatRows, // ✅ edited table values
+      selectedSheet,
+    });
   }
 
   if (!user) return null;
@@ -619,128 +682,122 @@ export default function DocSpecialistHome() {
       </header>
 
       <section className="mx-auto max-w-6xl px-4 py-6">
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-            <h2 className="text-base font-semibold text-slate-900">Upload Excel</h2>
-            <p className="mt-1 text-sm text-slate-500">
-              Upload TB sheet and convert it to JSON (auto mapping + nesting + captures top header).
-            </p>
+        <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+          <h2 className="text-base font-semibold text-slate-900">Upload Excel</h2>
+          <p className="mt-1 text-sm text-slate-500">
+            Parse TB → Preview → Edit → Download Excel (download uses edited table data)
+          </p>
 
-            <div className="mt-4 space-y-3">
-              <input
-                type="file"
-                accept=".xlsx,.xls"
-                onChange={handleExcelUpload}
-                className="block w-full text-sm text-slate-700
-                           file:mr-4 file:rounded-xl file:border-0
-                           file:bg-slate-900 file:px-4 file:py-2.5
-                           file:text-sm file:font-medium file:text-white
-                           hover:file:bg-slate-800"
-              />
+          <div className="mt-4 space-y-3">
+            <input
+              type="file"
+              accept=".xlsx,.xls"
+              onChange={handleExcelUpload}
+              className="block w-full text-sm text-slate-700
+                         file:mr-4 file:rounded-xl file:border-0
+                         file:bg-slate-900 file:px-4 file:py-2.5
+                         file:text-sm file:font-medium file:text-white
+                         hover:file:bg-slate-800"
+            />
 
-              {fileName ? (
-                <p className="text-xs text-slate-500">
-                  Selected: <span className="font-medium text-slate-700">{fileName}</span>
-                </p>
-              ) : null}
+            {fileName ? (
+              <p className="text-xs text-slate-500">
+                Selected: <span className="font-medium text-slate-700">{fileName}</span>
+              </p>
+            ) : null}
 
-              {sheetNames.length ? (
-                <div className="flex items-center gap-2">
-                  <label className="text-xs font-medium text-slate-600">Sheet</label>
-                  <select
-                    value={selectedSheet}
-                    onChange={(e) => {
-                      const s = e.target.value;
-                      setSelectedSheet(s);
-                      handleReparse(s);
-                    }}
-                    className="flex-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-black
-                               focus:outline-none focus:ring-4 focus:ring-slate-200"
+            {sheetNames.length ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <label className="text-xs font-medium text-slate-600">Sheet</label>
+                <select
+                  value={selectedSheet}
+                  onChange={(e) => {
+                    const s = e.target.value;
+                    setSelectedSheet(s);
+                    handleReparse(s);
+                  }}
+                  className="flex-1 min-w-[220px] rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-black
+                             focus:outline-none focus:ring-4 focus:ring-slate-200"
+                >
+                  {sheetNames.map((s) => (
+                    <option key={s} value={s}>
+                      {s}
+                    </option>
+                  ))}
+                </select>
+
+                <button
+                  type="button"
+                  onClick={() => handleReparse(selectedSheet)}
+                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700
+                             hover:bg-slate-50 active:bg-slate-100"
+                >
+                  Re-parse
+                </button>
+              </div>
+            ) : null}
+
+            {uploadErr ? (
+              <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                {uploadErr}
+              </div>
+            ) : null}
+
+            {meta && flatRows.length ? (
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-2">
+                <div className="text-xs text-slate-500">
+                  Parsed <span className="font-medium text-slate-700">{flatRows.length}</span> rows
+                  <div className="mt-1 text-[11px] text-slate-400">
+                    Header lines: {meta.headerLines?.length ?? 0} • Data starts: {meta.dataStartIdx}
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setEditMode((v) => !v)}
+                    className="rounded-xl bg-slate-900 px-3 py-2 text-xs font-medium text-white
+                               hover:bg-slate-800 active:bg-slate-950 transition"
                   >
-                    {sheetNames.map((s) => (
-                      <option key={s} value={s}>
-                        {s}
-                      </option>
-                    ))}
-                  </select>
+                    {editMode ? "Exit Edit Mode" : "Edit Mode"}
+                  </button>
 
                   <button
                     type="button"
-                    onClick={() => handleReparse(selectedSheet)}
-                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700
+                    onClick={resetEdits}
+                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700
                                hover:bg-slate-50 active:bg-slate-100"
                   >
-                    Re-parse
+                    Reset
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={downloadExcelFromTable}
+                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700
+                               hover:bg-slate-50 active:bg-slate-100"
+                  >
+                    Download Excel (Edited)
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setShowJson((v) => !v)}
+                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700
+                               hover:bg-slate-50 active:bg-slate-100"
+                  >
+                    {showJson ? "Hide JSON" : "Show JSON"}
                   </button>
                 </div>
-              ) : null}
-
-              {uploadErr ? (
-                <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-                  {uploadErr}
-                </div>
-              ) : null}
-
-              {tbJson ? (
-                <div className="flex flex-wrap items-center justify-between gap-2 pt-2">
-                  <div className="text-xs text-slate-500">
-                    Parsed{" "}
-                    <span className="font-medium text-slate-700">{tbJson.rowsFlat?.length ?? 0}</span>{" "}
-                    rows
-                    <div className="mt-1 text-[11px] text-slate-400">
-                      Cols: P={tbJson.meta.columns.particularsCol}, O={tbJson.meta.columns.openingCol}, D=
-                      {tbJson.meta.columns.debitCol}, C={tbJson.meta.columns.creditCol}, CL=
-                      {tbJson.meta.columns.closingCol}
-                    </div>
-                    <div className="mt-1 text-[11px] text-slate-400">
-                      Header lines captured: {tbJson.meta.headerLines?.length ?? 0}
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={downloadJson}
-                      className="rounded-xl bg-slate-900 px-3 py-2 text-xs font-medium text-white
-                                 hover:bg-slate-800 active:bg-slate-950 transition"
-                    >
-                      Download JSON
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => downloadAsExcel(tbJson, selectedSheet)}
-                      className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700
-                                 hover:bg-slate-50 active:bg-slate-100"
-                    >
-                      Download Excel
-                    </button>
-                  </div>
-                </div>
-              ) : null}
-            </div>
+              </div>
+            ) : null}
           </div>
         </div>
 
-        {tbJson ? (
+        {/* Preview */}
+        {meta && flatRows.length ? (
           <div className="mt-6 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <h3 className="text-base font-semibold text-slate-900">Preview</h3>
-                <p className="text-xs text-slate-500">
-                  Sheet: <span className="font-medium text-slate-700">{selectedSheet}</span>
-                </p>
-              </div>
-
-              <button
-                type="button"
-                onClick={() => setShowJson((v) => !v)}
-                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700
-                           hover:bg-slate-50 active:bg-slate-100"
-              >
-                {showJson ? "Hide JSON" : "Show JSON"}
-              </button>
-            </div>
+            <h3 className="text-base font-semibold text-slate-900">Preview (editable)</h3>
 
             <div className="mt-4 overflow-auto rounded-xl border border-slate-200">
               <table className="min-w-full text-sm">
@@ -753,26 +810,95 @@ export default function DocSpecialistHome() {
                     <th className="px-3 py-2 border-b border-slate-200">Closing</th>
                   </tr>
                 </thead>
+
                 <tbody>
                   {previewRows.map((r) => (
                     <tr key={r.rowNo} className="odd:bg-white even:bg-slate-50">
                       <td className="px-3 py-2 border-b border-slate-200">
-                        <span className="text-slate-700">
-                          {r.level > 0 ? "— ".repeat(r.level) : ""}
-                          {r.ledgerName}
-                        </span>
+                        {editMode ? (
+                          <input
+                            className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm"
+                            style={{ paddingLeft: 8 + (r.level || 0) * 16 }}
+                            value={r.ledgerName ?? ""}
+                            onChange={(e) => updateRow(r.rowNo, { ledgerName: e.target.value })}
+                          />
+                        ) : (
+                          <span className="text-slate-700" style={{ paddingLeft: (r.level || 0) * 16, display: "inline-block" }}>
+                            {r.ledgerName}
+                          </span>
+                        )}
                       </td>
+
                       <td className="px-3 py-2 border-b border-slate-200 text-slate-700">
-                        {r.opening.amount ?? ""} {r.opening.side ?? ""}
+                        {editMode ? (
+                          <div className="flex items-center gap-2">
+                            <input
+                              className="w-28 rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm"
+                              value={r.opening?.amount ?? ""}
+                              onChange={(e) => updateOpening(r.rowNo, "amount", e.target.value)}
+                              placeholder="amount"
+                            />
+                            <select
+                              className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm"
+                              value={r.opening?.side ?? ""}
+                              onChange={(e) => updateOpening(r.rowNo, "side", e.target.value)}
+                            >
+                              <option value="">-</option>
+                              <option value="Dr">Dr</option>
+                              <option value="Cr">Cr</option>
+                            </select>
+                          </div>
+                        ) : (
+                          formatAmountSide(r.opening)
+                        )}
                       </td>
+
                       <td className="px-3 py-2 border-b border-slate-200 text-slate-700">
-                        {r.transactions.debit ?? ""}
+                        {editMode ? (
+                          <input
+                            className="w-28 rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm"
+                            value={r.transactions?.debit ?? ""}
+                            onChange={(e) => updateTxn(r.rowNo, "debit", e.target.value)}
+                          />
+                        ) : (
+                          r.transactions?.debit ?? ""
+                        )}
                       </td>
+
                       <td className="px-3 py-2 border-b border-slate-200 text-slate-700">
-                        {r.transactions.credit ?? ""}
+                        {editMode ? (
+                          <input
+                            className="w-28 rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm"
+                            value={r.transactions?.credit ?? ""}
+                            onChange={(e) => updateTxn(r.rowNo, "credit", e.target.value)}
+                          />
+                        ) : (
+                          r.transactions?.credit ?? ""
+                        )}
                       </td>
+
                       <td className="px-3 py-2 border-b border-slate-200 text-slate-700">
-                        {r.closing.amount ?? ""} {r.closing.side ?? ""}
+                        {editMode ? (
+                          <div className="flex items-center gap-2">
+                            <input
+                              className="w-28 rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm"
+                              value={r.closing?.amount ?? ""}
+                              onChange={(e) => updateClosing(r.rowNo, "amount", e.target.value)}
+                              placeholder="amount"
+                            />
+                            <select
+                              className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm"
+                              value={r.closing?.side ?? ""}
+                              onChange={(e) => updateClosing(r.rowNo, "side", e.target.value)}
+                            >
+                              <option value="">-</option>
+                              <option value="Dr">Dr</option>
+                              <option value="Cr">Cr</option>
+                            </select>
+                          </div>
+                        ) : (
+                          formatAmountSide(r.closing)
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -782,7 +908,15 @@ export default function DocSpecialistHome() {
 
             {showJson ? (
               <pre className="mt-4 max-h-96 overflow-auto rounded-xl bg-slate-900 p-4 text-xs text-slate-100">
-                {JSON.stringify(tbJson, null, 2)}
+                {JSON.stringify(
+                  {
+                    meta,
+                    // IMPORTANT: download uses flatRows (edited state)
+                    rowsFlat: flatRows,
+                  },
+                  null,
+                  2
+                )}
               </pre>
             ) : null}
           </div>
