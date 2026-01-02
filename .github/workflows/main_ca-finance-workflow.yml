@@ -11,7 +11,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     permissions:
       contents: read #This is required for actions/checkout
 
@@ -21,14 +21,14 @@ jobs:
       - name: Set up Node.js version
         uses: actions/setup-node@v3
         with:
-          node-version: '24.x'
+          node-version: '22.x'
 
       - name: npm install, build, and test
         run: |
           npm install
           npm run build --if-present
           npm run test --if-present
-
+      
       - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v4
         with:
@@ -51,13 +51,13 @@ jobs:
       - name: Login to Azure
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_A9E79F56469B4C36B9E56B5CB2A53B92 }}
-          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_AC6DC664AD4E4734AC297D0EBF51C8F9 }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_B76463BDCD874AF48B06C885E4A54C8C }}
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_4AE556DC12C34011B5B26A0F9B6F6599 }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_6780932C12D0464DB451F9BB15FF4454 }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_CF2F964FF64F46BA80AF7E18A542BAC0 }}
 
       - name: 'Deploy to Azure Web App'
-        id: deploy-to-webapp
         uses: azure/webapps-deploy@v3
+        id: deploy-to-webapp
         with:
           app-name: 'ca-finance-workflow'
           slot-name: 'Production'
